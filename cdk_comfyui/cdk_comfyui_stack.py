@@ -26,12 +26,12 @@ import json, hashlib
 from cdk_nag import NagSuppressions
 
 # with open(
-#     "./cdk_comfyui_sunbiao/cert.json",
+#     "./cdk_comfyui/cert.json",
 #     "r",
 # ) as file:
 #     config = json.load(file)
 
-class CdkComfyuiSunbiaoStack(Stack):
+class CdkComfyuiStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -40,26 +40,26 @@ class CdkComfyuiSunbiaoStack(Stack):
 
         # example resource
         # queue = sqs.Queue(
-        #     self, "CdkComfyuiSunbiaoQueue",
+        #     self, "CdkComfyuiQueue",
         #     visibility_timeout=Duration.seconds(300),
         # )
 
-                # Setting
+        # Setting
         unique_input = f"{self.account}-{self.region}-comfyui"
         unique_hash = hashlib.sha256(unique_input.encode('utf-8')).hexdigest()[:10]
         suffix = unique_hash.lower()
         
-              # Get context
+        # Get context
         autoScaleDown = self.node.try_get_context("autoScaleDown")
         if autoScaleDown is None:
             autoScaleDown = True
 
         cheapVpc = self.node.try_get_context("cheapVpc") or False
         
-        scheduleAutoScaling = self.node.try_get_context("scheduleAutoScaling") or False
+        scheduleAutoScaling = self.node.try_get_context("scheduleAutoScaling") or True
         timezone = self.node.try_get_context("timezone") or "UTC"
-        scheduleScaleUp = self.node.try_get_context("scheduleScaleUp") or "0 9 * * 1-5"
-        scheduleScaleDown = self.node.try_get_context("scheduleScaleDown") or "0 18 * * *"
+        scheduleScaleUp = self.node.try_get_context("scheduleScaleUp") or "0 2 * * 1-5"
+        scheduleScaleDown = self.node.try_get_context("scheduleScaleDown") or "0 14 * * *"
         
         if cheapVpc:
             natInstance = ec2.NatProvider.instance_v2(
@@ -68,7 +68,7 @@ class CdkComfyuiSunbiaoStack(Stack):
             )
 
         vpc = ec2.Vpc(
-            self, "ComfyRickVPC",
+            self, "ComfyVPC",
             max_azs=2,  # Define the maximum number of Availability Zones
             subnet_configuration=[
                 ec2.SubnetConfiguration(
@@ -146,8 +146,8 @@ class CdkComfyuiSunbiaoStack(Stack):
         launchTemplate = ec2.LaunchTemplate(
             self,
             "Host",
-            launch_template_name="ComfyLaunchTemplateRickHost",
-            instance_type=ec2.InstanceType("g4dn.2xlarge"),
+            launch_template_name="ComfyLaunchTemplateHost",
+            instance_type=ec2.InstanceType("g6.2xlarge"),
             machine_image=ecs.EcsOptimizedImage.amazon_linux2(
                 hardware_type=ecs.AmiHardwareType.GPU
             ),
@@ -166,7 +166,7 @@ class CdkComfyuiSunbiaoStack(Stack):
         auto_scaling_group = autoscaling.AutoScalingGroup(
             self,
             "ASG",
-            auto_scaling_group_name="ComfyRickASG",
+            auto_scaling_group_name="ComfyASG",
             vpc=vpc,
             mixed_instances_policy=autoscaling.MixedInstancesPolicy(
                 instances_distribution=autoscaling.InstancesDistribution(
@@ -175,9 +175,9 @@ class CdkComfyuiSunbiaoStack(Stack):
                 ),
                 launch_template=launchTemplate,
                 launch_template_overrides=[
-                    autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g4dn.2xlarge")),
-                    autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g5.2xlarge")),
                     autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g6.2xlarge")),
+                    autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g5.2xlarge")),
+                    autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g4dn.4xlarge")),
                 ],
             ),
             min_capacity=0,
@@ -198,44 +198,64 @@ class CdkComfyuiSunbiaoStack(Stack):
             period=Duration.minutes(1)
         )
 
-        # Scale down to zero if no activity for an hour
-        if autoScaleDown:
-            # create a CloudWatch alarm to track the CPU utilization
-            cpu_alarm = cloudwatch.Alarm(
+        if scheduleAutoScaling:
+            # Create a scheduled action to set the desired capacity to 0
+            after_work_hours_action = autoscaling.ScheduledAction(
                 self,
-                "CPUUtilizationAlarm",
-                metric=cpu_utilization_metric,
-                threshold=1,
-                evaluation_periods=60,
-                datapoints_to_alarm=60,
-                comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD
-            )
-            scaling_action = autoscaling.StepScalingAction(
-                self,
-                "ScalingAction",
+                "AfterWorkHoursAction",
                 auto_scaling_group=auto_scaling_group,
-                adjustment_type=autoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-                cooldown=Duration.seconds(120)
+                desired_capacity=0,
+                time_zone=timezone,
+                schedule=autoscaling.Schedule.expression(scheduleScaleDown)
             )
-            # Add scaling adjustments
-            scaling_action.add_adjustment(
-                adjustment=-1,  # scaling adjustment (reduce instance count by 1)
-                upper_bound=1   # upper threshold for CPU utilization
+            # Create a scheduled action to set the desired capacity to 1
+            start_work_hours_action = autoscaling.ScheduledAction(
+                self,
+                "StartWorkHoursAction",
+                auto_scaling_group=auto_scaling_group,
+                desired_capacity=1,
+                time_zone=timezone,
+                schedule=autoscaling.Schedule.expression(scheduleScaleUp)
             )
-            scaling_action.add_adjustment(
-                adjustment=0,   # No change in instance count
-                lower_bound=1   # Apply this when the metric is above 2%
-            )
-            # Link the StepScalingAction to the CloudWatch alarm
-            cpu_alarm.add_alarm_action(
-                cw_actions.AutoScalingAction(scaling_action)
-            )
+
+        # # Scale down to zero if no activity for an hour
+        # if autoScaleDown:
+        #     # create a CloudWatch alarm to track the CPU utilization
+        #     cpu_alarm = cloudwatch.Alarm(
+        #         self,
+        #         "CPUUtilizationAlarm",
+        #         metric=cpu_utilization_metric,
+        #         threshold=1,
+        #         evaluation_periods=60,
+        #         datapoints_to_alarm=60,
+        #         comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD
+        #     )
+        #     scaling_action = autoscaling.StepScalingAction(
+        #         self,
+        #         "ScalingAction",
+        #         auto_scaling_group=auto_scaling_group,
+        #         adjustment_type=autoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+        #         cooldown=Duration.seconds(120)
+        #     )
+        #     # Add scaling adjustments
+        #     scaling_action.add_adjustment(
+        #         adjustment=-1,  # scaling adjustment (reduce instance count by 1)
+        #         upper_bound=1   # upper threshold for CPU utilization
+        #     )
+        #     scaling_action.add_adjustment(
+        #         adjustment=0,   # No change in instance count
+        #         lower_bound=1   # Apply this when the metric is above 2%
+        #     )
+        #     # Link the StepScalingAction to the CloudWatch alarm
+        #     cpu_alarm.add_alarm_action(
+        #         cw_actions.AutoScalingAction(scaling_action)
+        #     )
             
         # Create an ECS Cluster
         cluster = ecs.Cluster(
-            self, "ComfyUIRickCluster", 
+            self, "ComfyUICluster", 
             vpc=vpc, 
-            cluster_name="ComfyUIRickCluster", 
+            cluster_name="ComfyUICluster", 
             container_insights=True
         )
         
@@ -266,21 +286,21 @@ class CdkComfyuiSunbiaoStack(Stack):
         # ECR Repository
         ecr_repository = ecr.Repository.from_repository_name(
             self, 
-            "comfyui-rick", 
-            "comfyui-rick")
+            "comfyui-ecs", 
+            "comfyui-ecs")
             
 
         # CloudWatch Logs Group
         log_group = logs.LogGroup(
             self,
             "LogGroup",
-            log_group_name="/ecs/comfy-rick-ui",
+            log_group_name="/ecs/comfy-ecs-ui",
             removal_policy=RemovalPolicy.DESTROY,
         )
 
         # Docker Volume Configuration
         volume = ecs.Volume(
-            name="ComfyUIVolumeRick",
+            name="ComfyUIVolume",
             docker_volume_configuration=ecs.DockerVolumeConfiguration(
                 scope=ecs.Scope.SHARED,
                 driver="rexray/ebs",
@@ -308,7 +328,7 @@ class CdkComfyuiSunbiaoStack(Stack):
             gpu_count=1,
             memory_reservation_mib=30720,
             cpu=7680,
-            logging=ecs.LogDriver.aws_logs(stream_prefix="comfy-rick-ui", log_group=log_group),
+            logging=ecs.LogDriver.aws_logs(stream_prefix="comfy-ecs-ui", log_group=log_group),
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "curl -f http://localhost:8181/system_stats || exit 1"],
                 interval=Duration.seconds(15),
@@ -321,7 +341,7 @@ class CdkComfyuiSunbiaoStack(Stack):
         container.add_mount_points(
             ecs.MountPoint(
                 container_path="/home/user/opt/ComfyUI",
-                source_volume="ComfyUIVolumeRick",
+                source_volume="ComfyUIVolume",
                 read_only=False
             )
         )
@@ -374,7 +394,7 @@ class CdkComfyuiSunbiaoStack(Stack):
         alb = elbv2.ApplicationLoadBalancer(
             self, "ComfyUIALB",
             vpc=vpc,
-            load_balancer_name="ComfyUIRickALB",
+            load_balancer_name="ComfyUIALB",
             internet_facing=True,
             security_group=alb_security_group
         )
@@ -389,7 +409,7 @@ class CdkComfyuiSunbiaoStack(Stack):
         # Add target groups for ECS service
         ecs_target_group = elbv2.ApplicationTargetGroup(
             self,
-            "EcsTargetGroupRick",
+            "EcsTargetGroup",
             port=8181,
             vpc=vpc,
             protocol=elbv2.ApplicationProtocol.HTTP,
