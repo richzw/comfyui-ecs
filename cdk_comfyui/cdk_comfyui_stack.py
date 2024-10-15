@@ -19,7 +19,8 @@ from aws_cdk import (
     RemovalPolicy,
     CustomResource,
     # aws_sqs as sqs,
-    CfnOutput
+    CfnOutput,
+    aws_efs as efs
 )
 from constructs import Construct
 import json, hashlib
@@ -36,14 +37,6 @@ class CdkComfyuiStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # The code that defines your stack goes here
-
-        # example resource
-        # queue = sqs.Queue(
-        #     self, "CdkComfyuiQueue",
-        #     visibility_timeout=Duration.seconds(300),
-        # )
-
         # Setting
         unique_input = f"{self.account}-{self.region}-comfyui"
         unique_hash = hashlib.sha256(unique_input.encode('utf-8')).hexdigest()[:10]
@@ -59,12 +52,18 @@ class CdkComfyuiStack(Stack):
         scheduleAutoScaling = self.node.try_get_context("scheduleAutoScaling") or True
         timezone = self.node.try_get_context("timezone") or "UTC"
         scheduleScaleUp = self.node.try_get_context("scheduleScaleUp") or "0 2 * * 1-5"
-        scheduleScaleDown = self.node.try_get_context("scheduleScaleDown") or "0 14 * * *"
+        scheduleScaleDown = self.node.try_get_context("scheduleScaleDown") or "0 14 * * 1-5"
         
+        keyPair=ec2.KeyPair.from_key_pair_attributes(
+                self,
+                id='KeyPair', 
+                key_pair_name='YourKeyPairName')
+
         if cheapVpc:
             natInstance = ec2.NatProvider.instance_v2(
                 instance_type=ec2.InstanceType("t4g.nano"),
                 default_allowed_traffic=ec2.NatTrafficDirection.OUTBOUND_ONLY,
+                key_pair=keyPair,
             )
 
         vpc = ec2.Vpc(
@@ -107,10 +106,11 @@ class CdkComfyuiStack(Stack):
             description="Security Group for ALB",
             allow_all_outbound=True,
         )
+
         alb_security_group.add_ingress_rule(
             ec2.Peer.any_ipv4(),
             ec2.Port.tcp(80),
-            "Allow inbound traffic on port 443",
+            "Allow HTTP traffic on target IP",
         )
         
         # Create Auto Scaling Group Security Group
@@ -121,7 +121,14 @@ class CdkComfyuiStack(Stack):
             description="Security Group for ASG",
             allow_all_outbound=True,
         )
-        
+
+        # Allow NFS access within the EFS security group
+        asg_security_group.add_ingress_rule(
+            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(2049),
+            description="Allow NFS access from within the EFS security group"
+        )
+
         # EC2 Role for AWS internal use (if necessary)
         ec2_role = iam.Role(
             self,
@@ -129,19 +136,54 @@ class CdkComfyuiStack(Stack):
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2FullAccess"), # check if less privilege can be given
-                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonSSMManagedEC2InstanceDefaultPolicy")
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonSSMManagedEC2InstanceDefaultPolicy"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonElasticFileSystemFullAccess"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonElasticFileSystemClientFullAccess")
+                # iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerServiceforEC2Role")
             ]
         )
 
-        user_data_script = ec2.UserData.for_linux()
-        user_data_script.add_commands("""
-            #!/bin/bash
-            REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region) 
-            docker plugin install rexray/ebs --grant-all-permissions REXRAY_PREEMPT=true EBS_REGION=$REGION
-            systemctl restart docker
-        """)
+        efs_sg = ec2.SecurityGroup(
+            self, "EFSSG",
+            vpc=vpc,
+            description="Allow NFS access to EFS",
+            allow_all_outbound=True
+        )
         
+        # Allow NFS access within the EFS security group
+        efs_sg.add_ingress_rule(
+            peer= ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(2049),
+            description="Allow NFS access from within the EFS security group"
+        )
+
+         # Create EFS File System
+        file_system = efs.FileSystem(
+            self, "EFS",
+            vpc=vpc,
+            security_group=efs_sg,
+            #lifecycle_policy=efs.LifecyclePolicy.AFTER_14_DAYS,  # Files moved to IA after 14 days
+            performance_mode=efs.PerformanceMode.GENERAL_PURPOSE,
+            removal_policy=RemovalPolicy.DESTROY,  # NOT recommended for production
+            # encrypted=True  # Enable encryption if needed
+        )
+
+        # Optionally, create an Access Point
+        access_point = file_system.add_access_point(
+            "AccessPoint",
+            path="/home", # "/home/user/opt/ComfyUI",
+            create_acl=efs.Acl(
+                owner_uid="0",
+                owner_gid="0",
+                permissions="755"
+            ),
+            posix_user=efs.PosixUser(
+                gid="0",
+                uid="0"
+            )
+        )
         
+
         # Create an Auto Scaling Group with two EBS volumes
         launchTemplate = ec2.LaunchTemplate(
             self,
@@ -153,16 +195,18 @@ class CdkComfyuiStack(Stack):
             ),
             role=ec2_role,
             security_group=asg_security_group,
-            user_data=user_data_script,
+            key_pair=keyPair,
+            # associate_public_ip_address=True,
+            # user_data=user_data_script,
             block_devices=[
                 ec2.BlockDevice(
                     device_name="/dev/xvda",
-                    volume=ec2.BlockDeviceVolume.ebs(volume_size=50,
+                    volume=ec2.BlockDeviceVolume.ebs(volume_size=100,
                                                      encrypted=True)
                 )
             ],
         )
-        
+
         auto_scaling_group = autoscaling.AutoScalingGroup(
             self,
             "ASG",
@@ -177,7 +221,7 @@ class CdkComfyuiStack(Stack):
                 launch_template_overrides=[
                     autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g6.2xlarge")),
                     autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g5.2xlarge")),
-                    autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g4dn.4xlarge")),
+                    # autoscaling.LaunchTemplateOverrides(instance_type=ec2.InstanceType("g4dn.2xlarge")),
                 ],
             ),
             min_capacity=0,
@@ -217,39 +261,6 @@ class CdkComfyuiStack(Stack):
                 time_zone=timezone,
                 schedule=autoscaling.Schedule.expression(scheduleScaleUp)
             )
-
-        # # Scale down to zero if no activity for an hour
-        # if autoScaleDown:
-        #     # create a CloudWatch alarm to track the CPU utilization
-        #     cpu_alarm = cloudwatch.Alarm(
-        #         self,
-        #         "CPUUtilizationAlarm",
-        #         metric=cpu_utilization_metric,
-        #         threshold=1,
-        #         evaluation_periods=60,
-        #         datapoints_to_alarm=60,
-        #         comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD
-        #     )
-        #     scaling_action = autoscaling.StepScalingAction(
-        #         self,
-        #         "ScalingAction",
-        #         auto_scaling_group=auto_scaling_group,
-        #         adjustment_type=autoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-        #         cooldown=Duration.seconds(120)
-        #     )
-        #     # Add scaling adjustments
-        #     scaling_action.add_adjustment(
-        #         adjustment=-1,  # scaling adjustment (reduce instance count by 1)
-        #         upper_bound=1   # upper threshold for CPU utilization
-        #     )
-        #     scaling_action.add_adjustment(
-        #         adjustment=0,   # No change in instance count
-        #         lower_bound=1   # Apply this when the metric is above 2%
-        #     )
-        #     # Link the StepScalingAction to the CloudWatch alarm
-        #     cpu_alarm.add_alarm_action(
-        #         cw_actions.AutoScalingAction(scaling_action)
-        #     )
             
         # Create an ECS Cluster
         cluster = ecs.Cluster(
@@ -276,12 +287,12 @@ class CdkComfyuiStack(Stack):
             "ECSTaskExecutionRole",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
             managed_policies=[
-                iam.ManagedPolicy.from_aws_managed_policy_name(
-                    "service-role/AmazonECSTaskExecutionRolePolicy"
-                )
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonElasticFileSystemClientFullAccess"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonElasticFileSystemFullAccess")
             ],
         )
-        
+
         
         # ECR Repository
         ecr_repository = ecr.Repository.from_repository_name(
@@ -298,28 +309,31 @@ class CdkComfyuiStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Docker Volume Configuration
-        volume = ecs.Volume(
-            name="ComfyUIVolume",
-            docker_volume_configuration=ecs.DockerVolumeConfiguration(
-                scope=ecs.Scope.SHARED,
-                driver="rexray/ebs",
-                driver_opts={
-                    "volumetype": "gp3",
-                    "size": "250"  # Size in GiB
-                },
-                autoprovision=True
-            )
-        )
-        
+
         task_definition = ecs.Ec2TaskDefinition(
             self,
             "TaskDef",
             network_mode=ecs.NetworkMode.AWS_VPC,
             task_role=task_exec_role,
             execution_role=task_exec_role,
-            volumes=[volume]
+            # volumes=[volume]
         )
+
+        task_definition.add_volume(
+            name="ComfyUIVolume",
+            efs_volume_configuration=ecs.EfsVolumeConfiguration(
+                file_system_id=file_system.file_system_id,
+                root_directory="/",
+                transit_encryption="ENABLED",
+                authorization_config=ecs.AuthorizationConfig(
+                    access_point_id=access_point.access_point_id,
+                    iam="ENABLED"
+                ),
+                # transit_encryption_port=2049
+            )
+        )
+
+        # file_system.grant_root_access(task_exec_role.grant_principal)
 
         # Add container to the task definition
         container = task_definition.add_container(
@@ -329,18 +343,18 @@ class CdkComfyuiStack(Stack):
             memory_reservation_mib=30720,
             cpu=7680,
             logging=ecs.LogDriver.aws_logs(stream_prefix="comfy-ecs-ui", log_group=log_group),
-            health_check=ecs.HealthCheck(
-                command=["CMD-SHELL", "curl -f http://localhost:8181/system_stats || exit 1"],
-                interval=Duration.seconds(15),
-                timeout=Duration.seconds(10),
-                retries=8,
-                start_period=Duration.seconds(30)
-            )
+            # health_check=ecs.HealthCheck(
+            #     command=["CMD-SHELL", "curl -f http://localhost:8181/system_stats || exit 1"],
+            #     interval=Duration.seconds(30),
+            #     timeout=Duration.seconds(10),
+            #     retries=9,
+            #     start_period=Duration.seconds(200)
+            # )
         )
         
         container.add_mount_points(
             ecs.MountPoint(
-                container_path="/home/user/opt/ComfyUI",
+                container_path="/models", # Note: this path must be mapping to the folders under the comfyUI. WTF
                 source_volume="ComfyUIVolume",
                 read_only=False
             )
@@ -372,6 +386,13 @@ class CdkComfyuiStack(Stack):
             ec2.Port.tcp(8181),
             "Allow inbound traffic on port 8181",
         )
+
+        # 
+        efs_sg.add_ingress_rule(
+            peer= ec2.Peer.security_group_id(service_security_group.security_group_id),
+            connection=ec2.Port.tcp(2049),
+            description="Allow NFS access from within the EFS security group"
+        )
         
         # Create ECS Service
         service = ecs.Ec2Service(
@@ -386,8 +407,9 @@ class CdkComfyuiStack(Stack):
                 )
             ],
             security_groups=[service_security_group],
-            health_check_grace_period=Duration.seconds(30),
+            health_check_grace_period=Duration.seconds(120),
             min_healthy_percent=0,
+            enable_execute_command=True
         )
 
         # Application Load Balancer
@@ -398,12 +420,6 @@ class CdkComfyuiStack(Stack):
             internet_facing=True,
             security_group=alb_security_group
         )
-
-        # # Redirect Load Balancer traffic on port 80 to port 443
-        # alb.add_redirect(
-        #     source_protocol=elbv2.ApplicationProtocol.HTTP,
-        #     source_port=80
-        # )
         
         
         # Add target groups for ECS service
@@ -426,8 +442,8 @@ class CdkComfyuiStack(Stack):
                 healthy_http_codes="200",  # Adjust as needed
                 interval=Duration.seconds(30),
                 timeout=Duration.seconds(5),
-                unhealthy_threshold_count=3,
-                healthy_threshold_count=2,
+                unhealthy_threshold_count=5,
+                healthy_threshold_count=3,
             )
         )
         

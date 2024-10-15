@@ -20,7 +20,7 @@
     "scheduleAutoScaling": true,
     "timezone": "UTC",
     "scheduleScaleUp": "0 2 * * 1-5",
-    "scheduleScaleDown": "0 14 * * *",
+    "scheduleScaleDown": "0 14 * * 1-5",
     "selfSignUpEnabled": false,
     "allowedSignUpEmailDomains": null,
     "samlAuthEnabled": false,
